@@ -1,0 +1,236 @@
+#!/usr/bin/env -S bb
+; vim: filetype=clojure
+
+(ns prometheus-mastodon-exporter
+  "Adapts metrics from Mastodon's API for use by Prometheus' poller."
+  (:require [cheshire.core :as json]
+            [clojure [core :as c]
+                     [pprint :refer [pprint]]
+                     [string :as str]]
+            [clojure.tools [cli :as cli]
+                           [logging :refer [info warn]]]
+            [org.httpkit [client :as http.client]
+                         [server :as http.server]])
+  (:import (java.time LocalDateTime)
+           (java.time.format DateTimeFormatter)))
+
+(defn access-token
+  "Fetches the Mastodon access token from the environment."
+  []
+  (let [token (System/getenv "MASTODON_ACCESS_TOKEN")]
+    (when-not (and (string? token) (pos? (count token)))
+      (println "I need a MASTODON_ACCESS_TOKEN environment variable, please!")
+      (System/exit 1))
+    token))
+
+(def opt-spec
+  "CLI option specification."
+  [["-i" "--instance URL" "The URL of the Mastodon instance you want to monitor."
+    :default "https://woof.group"
+    :validate [#(re-find #"https://.+" %) "must be an HTTPS URL"]]
+   ["-p" "--port PORT" "What port to serve metrics on."
+    :default 10001
+    :parse-fn parse-long]
+   [nil "--prefix" "What to prefix each metric name with."
+    :default "mastodon"]])
+
+(defn opts
+  "Constructs a map of options we need to run."
+  [cli-args]
+  (let [{:keys [options arguments errors summary]}
+        (cli/parse-opts cli-args opt-spec)]
+    (when (seq errors)
+      (mapv println errors)
+      (println summary)
+      (System/exit 1))
+    (merge {:access-token (access-token)}
+           options)))
+
+(defn iso8601
+  "Renders a time as an ISO8601 string."
+  [^LocalDateTime t]
+  (.format DateTimeFormatter/ISO_LOCAL_DATE t))
+
+(defn dimensions
+  "Fetches stats from the /admin/dimensions API, including storage stats."
+  [{:keys [access-token instance]}]
+  (let [res (http.client/post
+              (str instance "/api/v1/admin/dimensions")
+              {:headers {"Authorization" (str "Bearer " access-token)}
+               :form-params {"keys[]" ["space_usage"]}})]
+    (delay
+      (let [{:keys [body error]} @res]
+        (when error
+          (throw (RuntimeException. error)))
+        (let [body (json/parse-string body true)]
+          (->> body
+               (mapcat (fn [dimension]
+                         (when (= (:key dimension) "space_usage")
+                           (map (fn [{:keys [key value]}]
+                                  [(str "space_usage_" key)
+                                   (parse-long value)])
+                                (:data dimension)))))
+               (into {})))))))
+
+(defn measures
+  "Fetches measure stats from the Mastodon server."
+  [{:keys [access-token instance] :as opts}]
+  (let [now             (LocalDateTime/now)
+        yesterday       (.minusDays now 1)
+        thirty-days-ago (.minusDays now 30)
+        res       (http.client/post
+                    (str instance "/api/v1/admin/measures")
+                    {:headers {"Authorization" (str "Bearer " access-token)}
+                     :form-params {"start_at" (iso8601 thirty-days-ago)
+                                   "end_at"   (iso8601 now)
+                                   "keys[]" ["active_users"
+                                             "new_users"
+                                             "interactions"
+                                             "opened_reports"
+                                             "resolved_reports"]}})]
+    (delay
+      (let [{:keys [status headers body error]} @res]
+        (when error
+          (throw (RuntimeException. error)))
+        (let [body (json/parse-string body true)]
+          (->> body
+               (mapcat (fn [measure]
+                         (concat
+                           ; Total reported over the 30-day window
+                           [[(str (:key measure) "_last_30_days")
+                             (parse-long (:total measure))]]
+                           ; And the specific value from yesterday's date
+                           (keep (fn [{:keys [date value]}]
+                                   ; hack cuz I'm too lazy to parse dates
+                                   (when (= (iso8601 yesterday) (subs date 0 10))
+                                     [(str (:key measure) "_yesterday")
+                                      (parse-long value)]))
+                                 (:data measure)))))
+               (into {})))))))
+
+(defn nodeinfo
+  "Fetches nodeinfo stats from the Mastodon server: the monthly active,
+  six-month active, total users, and local posts"
+  [{:keys [instance]}]
+  (let [res (http.client/get (str instance "/nodeinfo/2.0"))]
+    (delay
+      (let [{:keys [body error]} @res]
+        (when error
+          (throw (RuntimeException. error)))
+        (let [body (json/parse-string body true)
+              usage (:usage body)
+              users (:users usage)]
+          {"active_users_month"      (:activeMonth users)
+           "active_users_half_year"  (:activeHalfyear users)
+           "total_users"             (:total users)
+           "local_posts"             (:localPosts usage)})))))
+
+(defn instance
+  "Fetches instance stats from the Mastodon server: the number of known
+  domains, local users, and local statuses."
+  [{:keys [instance] :as opts}]
+  (let [res (http.client/get (str instance "/api/v1/instance"))]
+    (delay
+      (let [{:keys [status headers body error]} @res]
+        (when error
+          (throw (RuntimeException. error)))
+        (let [body (json/parse-string body true)
+              stats (:stats body)]
+          {"domain_count" (:domain_count stats 0)
+           "user_count"   (:user_count stats 0)
+           "status_count" (:status_count stats 0)})))))
+
+(defn instance-activity
+  "Fetches activity data for the present and previous week from
+  /instance/activity. My understanding is that the current week's number rises
+  over the week then drops to zero, and the previous week's number should never
+  change."
+  [{:keys [instance]}]
+  (let [res (http.client/get (str instance "/api/v1/instance/activity"))]
+    (delay
+      (let [{:keys [body error]} @res]
+        (when error
+          (throw (RuntimeException. error)))
+        (let [[this-week last-week] (json/parse-string body true)]
+          {"statuses_this_week"      (:statuses this-week)
+           "statuses_last_week"      (:statuses last-week)
+           "logins_this_week"        (:logins this-week)
+           "logins_last_week"        (:logins last-week)
+           "registrations_this_week" (:registrations this-week)
+           "registrations_last_week" (:registrations last-week)})))))
+
+(defn fetch
+  "Returns a map of metrics from various API endpoints."
+  [opts]
+  (->> [dimensions
+        instance
+        instance-activity
+        measures
+        nodeinfo]
+       (mapv (fn [f] (f opts)))
+       (map deref)
+       (reduce merge (sorted-map))))
+
+(def metric-specs
+  "Names, types, and help text for each metric."
+  [["active_users_30_days"       :gauge "Users active in the last 30 days."]
+   ["active_users_half_year"     :gauge "Users active in the last half year, per nodeinfo."]
+   ["active_users_month"         :gauge "Users active in the last month, per nodeinfo."]
+   ["active_users_yesterday"     :gauge "Users active on the previous day."]
+   ["domain_count"               :gauge "Number of known peer domains."]
+   ["interactions_yesterday"     :gauge "Favs, boosts, replies on local statuses during the previous day."]
+   ["local_posts"                :gauge "Number of local posts, per nodeinfo"]
+   ["logins_this_week"           :gauge "Number of logins this week."]
+   ["logins_last_week"           :gauge "Number of logins last week."]
+   ; Mastodon calls this new_users here, but registrations in other APIs. Not
+   ; sure if there's a technical difference, so I won't change the language.
+   ["new_users_yesterday"        :gauge "Users who signed up the previous day."]
+   ["opened_reports_yesterday"   :gauge "Reports opened the previous day."]
+   ["registrations_this_week"    :gauge "Number of registrations this week."]
+   ["resolved_reports_yesterday" :gauge "Reports resolved the previous day."]
+   ["space_usage_media"          :gauge "Bytes used by media files."]
+   ["space_usage_postgresql"     :gauge "Bytes used by Postgresql."]
+   ["space_usage_redis"          :gauge "Bytes used by Redis."]
+   ["status_count"               :gauge "Number of statuses on the local instance."]
+   ["statuses_this_week"         :gauge "Number of statuses posted this week."]
+   ["statuses_last_week"         :gauge "Number of statuses posted last week."]
+   ["total_users"                :gauge "Total users, per nodeinfo"]
+   ["user_count"                 :gauge "Number of users."]])
+
+(defn render
+  "Takes an options map and a metrics map. Renders a string in Prometheus'
+  format. See https://prometheus.io/docs/instrumenting/exposition_formats/"
+  [{:keys [prefix]} metrics]
+  (->> metric-specs
+       (mapcat (fn [[name type help]]
+                 (when-let [v (get metrics name)]
+                   [(str "# HELP " prefix "_" name " " help)
+                    (str "# TYPE " prefix "_" name " " (c/name type))
+                    (str prefix "_" name " " v)])))
+       (str/join "\n")))
+
+(defn serve!
+  "Runs web server for prometheus metrics"
+  [{:keys [port] :as opts}]
+  (let [app (fn app [req]
+              (try
+                (let [metrics (fetch opts)]
+                  {:status 200
+                   :headers {"Content-Type" "text/plain"}
+                   :body    (render opts metrics)})
+                (catch RuntimeException e
+                  (warn e)
+                  {:status  503
+                   :headers {"Content-Type" "text/plain"}
+                   :body    "Internal error! Check stderr logs"})))]
+    (http.server/run-server app {:port port})))
+
+(defn main
+  "Main entry point."
+  [argv]
+  (serve! (opts argv))
+  (while true
+    (Thread/sleep 1000)))
+
+(main *command-line-args*)
+(System/exit 0)
