@@ -2,7 +2,13 @@
 
 Fetches statistics from a Mastodon instance's API and exposes them as
 Prometheus metrics. You'll need
-[Babashka](https://github.com/babashka/babashka)_ to run this.
+[Babashka](https://github.com/babashka/babashka) to run this.
+
+## See Also
+
+[andrew-d's exporter](https://github.com/andrew-d/mastodon_exporter) queries
+the DB directly and produces post, account, report counts, and report
+resolution times.
 
 ## Quickstart
 
